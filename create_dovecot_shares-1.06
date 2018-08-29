@@ -1,0 +1,842 @@
+#!/usr/bin/perl -wT
+# BEGIN SURETEC TAGGED BLOCK {{{
+#=============================================================================
+#
+#         FILE:  create_dovecot_shares
+#
+#        USAGE:  create_dovecot_shares --help
+#
+#  DESCRIPTION:  Create Dovecot shares and put symlinks into user Maildir
+#
+#      OPTIONS:  --username
+#                --group
+#                --clean
+#                --dry-run
+#                --History
+#                --share-with
+#                --maildir
+#                --home
+#                --override
+#                --prefix
+#                --restore
+#                --skip
+#                --Version
+#                --verbose
+#                --man
+#                --help
+#
+# REQUIREMENTS:  Data::Dumper
+#                File::Find
+#                Fcntl
+#                Getopt::Long
+#                List::Util
+#                Pod::Usage
+#                POSIX
+#                Term::ANSIColor
+#                Storable
+#
+#         BUGS:  N/A
+#        NOTES:  N/A
+#       AUTHOR:  Gavin Henry (GH), <ghenry@suretecsystems.com>
+#      COMPANY:  Suretec Systems Ltd. - http://www.suretecsystems.com
+#      SUPPORT:  <support@suretecsystems.com>
+#      VERSION:  1.06
+#      CREATED:  26/05/06
+#      UPDATED:  01/11/06
+#
+#      CHANGES:  
+#                01/11/06 - Added --home option to allow home base directory
+#                           to be somewhere else like /var/hosted/home etc.
+#                         - General doc cleanup
+#
+#=============================================================================
+# END SURETEC TAGGED BLOCK }}}
+
+# Untaint environment
+$ENV{'PATH'}  = '/usr/local/bin:/usr/bin:/bin';
+$ENV{'SHELL'} = '/bin/bash';
+delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+
+# Returned by Perl::MinimumVersion 0.13
+require 5.006;
+
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Find;
+use Fcntl qw(:mode);
+use Getopt::Long;
+use List::Util qw(min);
+use Pod::Usage;
+use POSIX qw(strftime);
+use Term::ANSIColor qw(:constants);
+use Storable qw(nstore retrieve);
+
+# Unbuffer output
+$| = 1;
+
+# Normally use Readonly for this, but want to keep to Core Modules
+our $VERSION        = '1.06';
+our $SHARED         = '/dovecot-shared';
+our $PROGNAME       = 'create_dovecot_shares';
+our $SAVED          = '/var/cache/dovecot_shares.hist';
+our $HUMAN_RUN_DATE = strftime "%a %b %e %H:%M:%S %Y", localtime;
+our $NOW            = time;
+
+#-----------------------------------------------------------------------------
+# Standard Suretec method for parsing program arguments
+#
+# "perldoc Getopt::Long" for more info
+#-----------------------------------------------------------------------------
+
+die "Sorry, you need to be the root user - Suretec.\n" if ( $< != 0 );
+
+my %options;
+# Arrays for our options and one for tracking directories
+my ( @users, @share_with, @maildir, @skip, @change_perms_on, );
+
+GetOptions(
+    \%options,
+    qw( group=s override dry-run prefix=s home=s restore:s History clean 
+        Version verbose help|? man ),
+    'username=s'   => \@users,
+    'share-with=s' => \@share_with,
+    'maildir=s'    => \@maildir,
+    'skip=s'       => \@skip,
+);
+
+pod2usage(1) if $options{help} or ( !keys %options );
+pod2usage( -verbose => 2 ) if $options{man};
+
+print "This is $PROGNAME version $VERSION\n" if $options{Version};
+
+#-----------------------------------------------------------------------------
+# Begin
+#-----------------------------------------------------------------------------
+my %SAVE;
+
+# we only use $File::Find:name, so we set no_chdir here
+my %find_options = (
+    untaint         => 1,
+    untaint_pattern => qr{^([-+@\w\s&!\.\{\}#]+)$},
+    no_chdir        => '1',
+    wanted          => \&emails_and_dirs,
+);
+
+# Load previous save
+my $SAVE = retrieve("$SAVED") if -e $SAVED;
+
+# Reset counter
+my $run;
+if ( defined $SAVE->{counter} ) {
+
+    # We only keep a history of 10 runs
+    $SAVE->{counter} = 0 if $SAVE->{counter} == 10;
+
+    # Track from the counter
+    $run = $SAVE->{counter};
+}
+
+# New run
+++$run and ++$SAVE->{counter};
+
+@share_with = split_args(@share_with);
+@users      = split_args(@users);
+@maildir    = split_args(@maildir);
+@skip       = split_args(@skip);
+
+# Initialise directory and file start no. for save_previous
+my $dir_num  = 0;
+my $file_num = 0;
+
+#-----------------------------------------------------------------------------
+# Here we are checking the group we got passed
+#-----------------------------------------------------------------------------
+my $share_group;
+if ( $options{group} ) {
+
+    die "Need username and user to share!\n" if ( !@share_with or !@users );
+
+    die "Group: '$options{group}' does not exist! (typo?)\n"
+      if !defined getgrnam( $options{group} );
+
+    # getgrnam returns ($name, $passwd, $gid, $members)
+    # i.e $group_details[0] is $name etc. etc.
+    my @group_details = getgrnam( $options{group} );
+
+    # Check they are members
+    for my $user (@users, @share_with) {
+
+        # A user, by default is a member of their own group
+        next if $group_details[0] eq $user;
+
+        die "Username: '$user' is not a valid user!\n"
+          if !defined getpwnam($user);
+    
+        die "User '$user' is not a member of the '$options{group}' group\n"
+          if not $group_details[3] =~ m{$user};
+    }
+
+    die "Refusing to create a dovecot share with the share group set to"
+      . " 'root' (gid: $group_details[2])!\n"
+      if $group_details[2] == 0;
+
+    $share_group = $group_details[2];
+}
+
+#-----------------------------------------------------------------------------
+# Here we start the actual share creation, checking home basename and groups
+#-----------------------------------------------------------------------------
+my @homes;
+
+# Use --home or default to /home
+my $homebase = $options{home} || '/home';
+print BOLD GREEN, "Home basename is '$homebase'\n", RESET if $options{verbose};
+
+if (@users) {
+    die "Need users to share with!\n" if !@share_with;
+
+    for my $u (@share_with) {
+        die "Can not share with '$u': User '$u' does not exist! (typo?)\n"
+          if !defined getpwnam($u);
+    }
+
+    die "Need to set group for shares! Please provide --group e.g."
+      . " --group=sharedmail\n"
+      if !$options{group};
+
+    @homes = map { $homebase . "/" . clean_user($_) } @users;
+    
+    # Clear the previous run of same number in memory from %SAVE
+    delete $SAVE->{run}{$run};
+    
+    find( \%find_options, @homes );    # this populates %SAVE if it's not
+                                       # retreived above
+
+    # We only want to use these Maildirs if passed
+    if (@maildir) {
+        for my $maildir (@maildir) {
+            die "Maildir Directory: '$maildir' doesn't exist!\n"
+              if -d !$maildir;
+            create_share($maildir);
+        }
+        exit 0;
+    }
+
+    # $SAVE has been populated by File::Find
+    for my $dir ( keys %{ $SAVE->{run}{$run}{directory} } ) {
+        create_share( $SAVE->{run}{$run}{directory}{$dir}{dir}{name} );
+    }
+}
+
+#-----------------------------------------------------------------------------
+# Here we are printing to STDOUT, everything in the History file
+#-----------------------------------------------------------------------------
+if ( $options{History} ) {
+    my $SAVE = retrieve($SAVED)
+      if -e $SAVED
+      or die "History file: '$SAVED' does not exist\n"
+      . "Has $PROGNAME been run before?\n";
+
+    local $Data::Dumper::Varname  = 'Dovecot-share History:';
+    local $Data::Dumper::Sortkeys = 1;
+    print Dumper($SAVE), "\n";
+    exit 0;
+}
+
+#-----------------------------------------------------------------------------
+# Here we are restoring from the history file on the file system
+#-----------------------------------------------------------------------------
+if ( defined $options{restore} ) {    # restore:s sets an empty string ''.
+    my $SAVE = retrieve($SAVED)       # so if no run passed, we restore
+      if -e $SAVED                    # last run
+      or die "History file: '$SAVED' does not exist\n"
+      . "Has $PROGNAME been run before?\n";
+
+    my $restore;
+    if ( $options{restore} =~ m{\d+} ) {
+        $restore = $options{restore};
+        print "Restoring run: '$restore'\n";
+    }
+    else {
+
+        # Would use one of the various Date::* modules from
+        # the CPAN here, but don't want to use any non-core
+        # modules
+        my @runs;
+        for my $run_num ( keys %{ $SAVE->{run} } ) {
+            push @runs,
+              ( [ $run_num, $SAVE->{run}{$run_num}{restore_check_date} ] );
+        }
+
+        my @elapsed_time;
+        my %run_with;
+        for my $time (@runs) {
+            my $difference = $NOW - $time->[1];    # restore_check_date above
+            $run_with{ $time->[0] } = $difference; # Save, to find run below
+            push @elapsed_time, $difference;
+
+        }
+        my $last_run = min @elapsed_time;          # Closest run to $NOW
+
+        for my $to_restore ( keys %run_with ) {
+            $restore = $to_restore
+              if $run_with{$to_restore} == $last_run;    # Find the run key
+        }
+
+        my $seconds = $last_run % 60;
+        $last_run = ( $last_run - $seconds ) / 60;
+        my $minutes = $last_run % 60;
+        $last_run = ( $last_run - $minutes ) / 60;
+        my $hours = $last_run % 24;
+        $last_run = ( $last_run - $hours ) / 24;
+        my $days  = $last_run % 7;
+        my $weeks = ( $last_run - $days ) / 7;
+
+        print "Restoring the most recent run (run '$restore'), which was:\n"
+          . " $weeks week/s, $days day/s, $hours hour/s,"
+          . " $minutes minute/s and $seconds second/s ago.\n";
+    }
+
+    for my $dir ( keys %{ $SAVE->{run}{$restore}{directory} } ) {
+        if ( $SAVE->{run}{$restore}{directory}{$dir}{dir}{name} ) {
+            print BOLD GREEN, "***** DRY RUN *****\n", RESET;
+            print BOLD GREEN, "Restoring $SAVE->{run}{$restore}{directory}{$dir}{dir}{name}"
+              . " with uid:"
+              . " '$SAVE->{run}{$restore}{directory}{$dir}{uid}', "
+              . "gid '$SAVE->{run}{$restore}{directory}{$dir}{gid}', "
+              . "and mode '$SAVE->{run}{$restore}{directory}{$dir}{mode}'\n", RESET
+              if $options{verbose};
+
+            restore_emails_and_dirs(
+                $SAVE->{run}{$restore}{directory}{$dir}{uid},
+                $SAVE->{run}{$restore}{directory}{$dir}{gid},
+                $SAVE->{run}{$restore}{directory}{$dir}{dir}{name},
+                $SAVE->{run}{$restore}{directory}{$dir}{mode}
+            );
+        }
+
+        for my $file (
+            keys %{ $SAVE->{run}{$restore}{directory}{$dir}{dir}{file} } )
+        {
+            if ( $SAVE->{run}{$restore}{directory}{$dir}{dir}{file}{$file}
+                {name} )
+            {
+                print BOLD GREEN,
+"Restoring $SAVE->{run}{$restore}{directory}{$dir}{dir}{file}{$file}{name}"
+                  . " with uid:"
+                  . " '$SAVE->{run}{$restore}{directory}{$dir}{dir}{file}{$file}{uid}', "
+                  . "gid '$SAVE->{run}{$restore}{directory}{$dir}{dir}{file}{$file}{gid}', "
+                  . "and mode '$SAVE->{run}{$restore}{directory}{$dir}{dir}{file}{$file}{mode}'\n", RESET
+                  if $options{verbose};
+
+                restore_emails_and_dirs(
+                    $SAVE->{run}{$restore}{directory}{$dir}{dir}{file}{$file}
+                      {uid},
+                    $SAVE->{run}{$restore}{directory}{$dir}{dir}{file}{$file}
+                      {gid},
+                    $SAVE->{run}{$restore}{directory}{$dir}{dir}{file}{$file}
+                      {name},
+                    $SAVE->{run}{$restore}{directory}{$dir}{dir}{file}{$file}
+                      {mode}
+                );
+
+            }
+        }
+    }
+    exit 0;
+}
+
+#-----------------------------------------------------------------------------
+# Here we are removing the history file on the file system
+#-----------------------------------------------------------------------------
+if ( $options{clean} ) {
+    print
+"Are you sure you want to remove file: '$SAVED' ? [y/n (Enter to cancel)] ";
+    chomp( my $answer = <STDIN> );
+
+    if ( $answer eq 'y' ) {
+        unlink($SAVED)
+          or die "Failed to delete '$SAVED': $!\n";
+        print "Deleted $SAVED\n";
+        exit 0;
+    }
+    else {
+        print "Done.\n";
+        exit 0;
+    }
+}
+
+#-----------------------------------------------------------------------------
+# clean_user($username)
+#
+# Untaint a username, and check it's valid
+#-----------------------------------------------------------------------------
+sub clean_user {
+    my $unclean_user = shift;
+    if ( $unclean_user =~ qr{^([-+@\w.]+)$} ) {
+        my $clean = $1;
+        return $clean;
+    }
+    else {
+        die "Username: '$unclean_user' invalid!\n";
+    }
+
+    return;
+}
+
+#-----------------------------------------------------------------------------
+# clean_dir($dir)
+#
+# Untaint a directory
+#-----------------------------------------------------------------------------
+sub clean_dir {
+    my $unclean_dir = shift;
+    my ($clean_dir) = $unclean_dir =~ /^([-+@\w.\/\s&!\.]+)$/;
+    return $clean_dir;
+}
+
+#-----------------------------------------------------------------------------
+# clean_file($dir)
+#
+# Untaint a file
+#-----------------------------------------------------------------------------
+sub clean_file {
+    my $unclean_file = shift;
+    my ($clean_file) = $unclean_file =~ /^([-+@\w.\/\s,&!\.:=_]+)$/;
+    return $clean_file;
+}
+
+#-----------------------------------------------------------------------------
+# split_args(@args_to_split)
+#
+# Split up our commandline args - ghenry,john,james etc.
+#-----------------------------------------------------------------------------
+sub split_args {
+    my @to_split = @_;
+    my @split = split( /,/, join( ',', @to_split ) );
+    return @split;
+}
+
+#-----------------------------------------------------------------------------
+# restore_emails_and_dirs($uid, $group, $to_change, $mode)
+#
+# Function for restoring changes made during dovecot shares
+#-----------------------------------------------------------------------------
+sub restore_emails_and_dirs {
+    my $uid       = shift;
+    my $group     = shift;
+    my $to_change = shift;
+    my $mode      = shift;
+
+    return if $options{'dry-run'};
+            
+    chown $uid, $group, $to_change
+      or warn "Couldn't change ownership of '$to_change': $!\n";
+
+    chmod oct($mode), $to_change
+      or warn "Couldn't change permissions of '$to_change': $!\n";
+
+    return;
+}
+
+#-----------------------------------------------------------------------------
+# emails_and_dirs
+#
+# Callback for File::Find when creating dovecot shares
+#-----------------------------------------------------------------------------
+sub emails_and_dirs {
+
+    # Only files in Maildir
+    return if $File::Find::name !~ m{Maildir};
+
+    # No dovecot system files
+    return
+      if $File::Find::name =~ m{subscriptions|dovecot|public|control|index};
+
+    # No symlinks
+    return if -l $File::Find::name;
+
+    # Record permissions we have found right away
+    my ( $mode, $uid, $gid ) = ( stat($File::Find::name) )[ 2, 4, 5 ];
+
+    $mode = sprintf "%04o", S_IMODE($mode);
+
+    save_previous( $run, $File::Find::name, $mode, $uid, $gid );
+
+    return;
+}
+
+#-----------------------------------------------------------------------------
+# create_share($maildir)
+#
+# Main function for creating dovecot shares
+#-----------------------------------------------------------------------------
+sub create_share {
+    my $dir = shift;
+
+    # untaint $dir
+    $dir =~ /^([-+@\w.\/\s&!\.\{\}#]+)$/;
+    $dir = $1;
+
+    # Grabbing the new, cur and tmp folders here
+    push @change_perms_on, $dir;
+
+    # We don't want to add a dovecot-shared to new, cur or tmp dirs
+    return if $dir =~ m{(new|cur|tmp)$};
+
+    if ( ( -e $dir . $SHARED ) && !$options{override} ) {
+        print BOLD GREEN, "***** DRY RUN *****\n", RESET
+          if $options{'dry-run'};
+        print RED,
+          "Directory: $dir already shared (try --override)," . " skipping!\n",
+          RESET;
+    }
+    else {
+
+        # Check for dirs to skip straight away
+        if (@skip) {
+            for my $skip (@skip) {
+                return if $dir =~ m{$skip$};
+            }
+        }
+
+        print BOLD GREEN, "***** DRY RUN *****\n", RESET
+          if $options{'dry-run'};
+
+        for my $u (@share_with) {
+            print GREEN, "Sharing Maildir: $dir with user: '$u'\n", RESET;
+        }
+
+        return if $options{'dry-run'};
+
+        # Save to filesystem before we do anything, so we can
+        # do a --restore in case we mess up. $SAVE is setup in
+        # emails_and_dirs()
+        nstore( $SAVE, $SAVED )
+          or die "Can't save history: $!\n";
+
+        # More untainting
+        my $dovecot_file = clean_dir( $dir . $SHARED );
+
+        # Remove dovecot-shared, only if --override is set, as we enter
+        # this branch if dovecot-shared exists
+        if ( -e $dovecot_file ) {
+            unlink $dovecot_file
+              or die "Can't remove '$dovecot_file: $!\n";
+        }
+
+        open my $DOVECOT_SHARED, ">>", $dovecot_file
+          or die "Couldn't create $dovecot_file: $!\n";
+        close $DOVECOT_SHARED;
+
+        if ( -e $dovecot_file && $options{verbose} ) {
+            print "Created $dovecot_file\n";
+        }
+
+        # pick off the owner of the dir and use that for all perm changes
+        my $uid = ( stat($dir) )[4];
+
+        # untaint $uid
+        $uid =~ /^([\d]+)$/;
+        $uid = $1;
+
+        # untaint $share_group
+        $share_group =~ /^([\d]+)$/;
+        $share_group = $1;
+
+        # change perms on dirs and dovecot-shared
+        for my $to_change ( $dir, $dovecot_file, @homes, @change_perms_on ) {
+            change_perms( $uid, $to_change, $share_group );
+        }
+
+        # change_perms on e-mails, so they can be read
+        for my $dir ( keys %{ $SAVE->{run}{$run}{directory} } ) {
+            for my $file (
+                keys %{ $SAVE->{run}{$run}{directory}{$dir}{dir}{file} } )
+            {
+                change_perms(
+                    $uid,
+                    clean_file(
+                        $SAVE->{run}{$run}{directory}{$dir}{dir}{file}{$file}
+                          {name}
+                    ),
+                    $share_group
+                );
+            }
+        }
+
+        # create the symlink
+        for my $user (@share_with) {
+            for my $orig_user (@users) {
+                my $prefix = $options{prefix} || ucfirst($orig_user);
+
+                # grab the maildir
+                my ($orig_maildir) = $dir =~ m{Maildir/(.*)$};
+                $orig_maildir = '.TOP-INBOX' if !defined $orig_maildir;
+
+                # biiiiggggg concatenation :-(
+                my $symlink =
+                  clean_dir(
+                    $homebase . $user . '/Maildir/.' . $prefix . $orig_maildir );
+
+                next if -l $symlink;    # Don't create same symlink
+
+                symlink $dir, $symlink
+                  or warn
+                  "Couldn't create symlink in '" . $homebase . $user . "/Maildir/': $!\n";
+
+                if ( -l $symlink && $options{verbose} ) {
+                    print "Symlink at: '$symlink'\n";
+                }
+            }
+        }
+    }
+    return;
+}
+
+#-----------------------------------------------------------------------------
+# change_perms($uid, $to_change, $share_group)
+#
+# Function for changing File Permissions
+#-----------------------------------------------------------------------------
+sub change_perms {
+    my $uid         = shift;
+    my $to_change   = shift;
+    my $share_group = shift;
+
+    print "Changing ownership and permissions of: $to_change"
+      . " to: 'rwxrws--- $uid $share_group'\n"
+      if $options{verbose};
+
+    chown $uid, $share_group, $to_change
+      or warn "Couldn't change ownership of '$to_change': $!\n";
+
+    # can use 02770 here without oct, but keeps similarity between
+    # command line chmod
+    chmod oct(2770), $to_change
+      or warn "Couldn't change permissions of '$to_change': $!\n";
+
+    return;
+}
+
+#-----------------------------------------------------------------------------
+# save_previous($run, $dir_or_file, $mode, $uid, $gid)
+#
+# Function for saving File Permissions etc. before making changes for the
+# Dovecot Shares
+#-----------------------------------------------------------------------------
+sub save_previous {
+    my $run         = shift;
+    my $dir_or_file = shift;
+    my $mode        = shift;
+    my $uid         = shift;
+    my $gid         = shift;
+    
+    # Setup our dates
+    $SAVE->{run}{$run}{run_date}           = $HUMAN_RUN_DATE;
+    $SAVE->{run}{$run}{restore_check_date} = $NOW;
+
+    if ( -d $dir_or_file ) {
+        ++$dir_num;
+        $SAVE->{run}{$run}{directory}{$dir_num}{dir}{name} = $dir_or_file;
+        $SAVE->{run}{$run}{directory}{$dir_num}{mode}      = $mode;
+        $SAVE->{run}{$run}{directory}{$dir_num}{uid}       = $uid;
+        $SAVE->{run}{$run}{directory}{$dir_num}{gid}       = $gid;
+    }
+    elsif ( -f $dir_or_file ) {
+        ++$file_num;
+        for my $dir ( keys %{ $SAVE->{run}{$run}{directory} } ) {
+            if (
+                $dir_or_file =~ $SAVE->{run}{$run}{directory}{$dir}{dir}{name} )
+            {
+                $SAVE->{run}{$run}{directory}{$dir}{dir}{file}{$file_num}
+                  {name} = $dir_or_file;
+                $SAVE->{run}{$run}{directory}{$dir}{dir}{file}{$file_num}
+                  {mode} = $mode;
+                $SAVE->{run}{$run}{directory}{$dir}{dir}{file}{$file_num}{uid} =
+                  $uid;
+                $SAVE->{run}{$run}{directory}{$dir}{dir}{file}{$file_num}{gid} =
+                  $gid;
+            }
+        }
+    }
+    else {
+        return;
+    }
+}
+
+# {{{ Documentation
+__END__
+
+=pod
+
+=head1 NAME
+
+create_dovecot_shares - Create Dovecot shares and put symlinks into user Maildirs
+
+=head1 VERSION
+
+This document describes create_dovecot_shares version 1.06
+
+=head1 SYNOPSIS
+
+    [root@suretec home]$ create_dovecot_shares [OPTIONS] 
+
+    INPUT OPTIONS:
+    --username      Username/Usernames you want to share the Maildir of, comma seperated
+    --group         Group for Maildir share ownership 
+    --dry-run       Doesn't make any changes, just shows what would happen
+    --share-with    List of users to share with (creates symlinks in their Maildir), comma seperated
+    --maildir       List of Maildirs to share, or all found in home directory if not specified, comma seperated.
+    --home          Where the home directories are, for use in a hosted environment. Defaults to /home is not specified
+    --override      Overrides all existing shares (dovecot-shared file and perms) if found
+    --skip          Skips existing share with same name if found, comma seperated 
+    --prefix        Prefix for shares. Default is username.INBOX etc.
+    --restore       Restore to before changes. Takes a run number, e.g. 5 runs back
+
+
+    OUTPUT OPTIONS:
+    --History       Prints Summary of last Create Share runs (we keep 10.)
+    --clean         Removes the dovecot_shares.hist file from F</var/cache>
+    --Version       Print program version
+    --verbose       Print in fine detail what is happening
+    --help          List this help
+    --man           List the full create_dovecot_shares manpage
+
+    EXAMPLES:
+    [root@suretec home]$ create_dovecot_shares --username=ghenry --group=support --skip=/home/ghenry/Maildir,/home/ghenry/Maildir/.Sent --share-with=john,admin --dry-run
+
+    [root@suretec home]$ create_dovecot_shares --username=ghenry,john,jack --group=accounts --share-with=philip --override
+
+    [root@suretec home]$ create_dovecot_shares --username=ghenry --share-with=john --group=accounts --home=/var/hosted/home --prefix=OFFICE 
+
+    [root@suretec home]$ create_dovecot_shares --username=ghenry --group=accounts --maildir=/home/john/Maildir/.Sent,/home/john/Maildir/.Drafts
+
+    [root@suretec home]$ create_dovecot_shares --restore 5  
+
+    [root@suretec home]$ create_dovecot_shares --History
+
+=head1 DESCRIPTION
+
+Creating lots of F<dovecot-shared> files, changing permissions and creating symlinks is
+ a pain, especially when dealing with more than a handle of users. 
+
+C<create_dovecot_shares> helps.
+
+It modifies users home directories and Maildirs (permissions) for sharing via 
+Dovecot, and creates symlinks into the Maildir you want the shares accessed 
+from.
+
+There's even a C<restore> option, to roll back any changes you made with a 
+history of 10 runs.
+
+See L<"SYNOPSIS"> for examples.
+
+Must be root.
+
+=head1 README
+
+Creating lots of F<dovecot-shared> files for the Dovecot IMAP Server, changing permissions and creating symlinks is a pain, especially when dealing with more than a handle of users. 
+
+create_dovecot_shares helps
+
+=head1 CONFIGURATION AND ENVIRONMENT
+
+This script requires no configuration files or environment variables.
+
+It does set:
+
+    $ENV{'PATH'}= '/usr/local/bin:/usr/bin:/bin';
+    $ENV{'SHELL'}= '/bin/bash';
+    delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+
+=head1 PREREQUISITES
+
+=over
+
+=item *
+L<Data::Dumper>
+
+=item * 
+L<File::Find>
+
+=item * 
+L<Fcntl>
+
+=item * 
+L<Getopt::Long>
+
+=item * 
+L<List::Util>
+
+=item * 
+L<Pod::Usage>
+
+=item * 
+L<POSIX>
+
+=item *
+L<Term::ANSIColor>
+
+=item * 
+L<Storable>
+
+=back
+
+=head1 OSNAMES
+
+linux
+
+=head1 SCRIPT CATEGORIES
+
+Mail
+
+=head1 INCOMPATIBILITIES
+
+None reported.
+
+=head1 BUGS AND LIMITATIONS
+
+No bugs have been reported.
+
+Please report any bugs or feature requests to C<support@suretecsystems.com> or
+call the number on L<http://www.suretecsystems.com/contact/>.
+
+=head1 AUTHOR
+
+Gavin Henry, C<< <ghenry@suretecsystems.com> >>
+
+=head1 LICENCE AND COPYRIGHT
+
+Copyright (c) 2006, Suretec Systems Ltd. L<http://www.suretecsystems.com/>
+
+Copyright (c) 2006,  Gavin Henry, C<< <ghenry@suretecsystems.com> >>. All rights reserved.
+
+This module is free software; you can redistribute it and/or
+modify it under the terms of the GPL V2. See perldoc L<perlgpl>.
+
+=head1 DISCLAIMER OF WARRANTY
+
+BECAUSE THIS SOFTWARE IS LICENSED FREE OF CHARGE, THERE IS NO WARRANTY
+FOR THE SOFTWARE, TO THE EXTENT PERMITTED BY APPLICABLE LAW. EXCEPT WHEN
+OTHERWISE STATED IN WRITING THE COPYRIGHT HOLDERS AND/OR OTHER PARTIES
+PROVIDE THE SOFTWARE "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER
+EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. THE
+ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE SOFTWARE IS WITH
+YOU. SHOULD THE SOFTWARE PROVE DEFECTIVE, YOU ASSUME THE COST OF ALL
+NECESSARY SERVICING, REPAIR, OR CORRECTION.
+
+IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MAY MODIFY AND/OR
+REDISTRIBUTE THE SOFTWARE AS PERMITTED BY THE ABOVE LICENCE, BE
+LIABLE TO YOU FOR DAMAGES, INCLUDING ANY GENERAL, SPECIAL, INCIDENTAL,
+OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE
+THE SOFTWARE (INCLUDING BUT NOT LIMITED TO LOSS OF DATA OR DATA BEING
+RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD PARTIES OR A
+FAILURE OF THE SOFTWARE TO OPERATE WITH ANY OTHER SOFTWARE), EVEN IF
+
+=begin pod_to_ignore
+# }}} 
+
