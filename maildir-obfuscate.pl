@@ -1,15 +1,9 @@
 #!/usr/bin/env perl
 use strict;
 
-# mdbox-obfuscate.pl < ~/mdbox/storage/m.1 > m.obfuscated
+# maildir-obfuscate.pl < maildir-file > maildir-file.obfuscated
 # Check with text editor that everything appears to be obfuscated.
 # This script isn't perfect..
-
-# For testing that you can reproduce problem:
-# mkdir -p ~/mdbox-test/storage
-# cp m.obfuscated ~/mdbox-test/storage/m.1
-# doveadm -o mail=mdbox:~/mdbox-test force-resync INBOX
-# /usr/local/libexec/dovecot/imap -o mail=mdbox:~/mdbox-test
 
 my $state = 0;
 my $hdr_name = "";
