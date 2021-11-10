@@ -1,10 +1,10 @@
 #!/usr/bin/perl
 # Copyright 2008-2002 Timo Sirainen
-# Last updated: 2012-07-28
+# Last updated: 2021-11-10
 
 # NOTE: Requires Dovecot v2.0.13+ for POP3 'O' entries
 
-# Based largely on courier-dovecot-migrate.pl v1.1.7:
+# Based largely on courier-dovecot-migrate.pl v1.1.8:
 # cpanel12 - maildir-migrate                      Copyright(c) 2008 cPanel, Inc.
 #                                                           All Rights Reserved.
 # copyright@cpanel.net                                         http://cpanel.net
@@ -174,6 +174,10 @@ sub read_courier_pop3 {
         # /2 <next uid> <uidvalidity>
         $_ = <$f>;
     }
+    elsif ( $pop3_hdr =~ /^\/3 (\d+) (\d+)$/ ) {
+        # /3 <next uid> <uidvalidity>
+        $_ = <$f>;
+    }
     elsif ( $pop3_hdr =~ /^\/1 (\d+)$/ ) {
         # /1 <next uid>
         $_ = <$f>;
@@ -195,7 +199,11 @@ sub read_courier_pop3 {
         
         my ( $full_fname, $fsize, $uid, $uidv );
         
-        if ( /^([^ ]+) (\d+) (\d+):(\d+)$/ ) {
+        if ( /^([^ ]+) (\d+) (\d+):(\d+):\d$/ ) {
+            # v3
+            ( $full_fname, $fsize, $uid, $uidv ) = ( $1, $2, $3, $4 );
+        }
+        elsif ( /^([^ ]+) (\d+) (\d+):(\d+)$/ ) {
             # v2
             ( $full_fname, $fsize, $uid, $uidv ) = ( $1, $2, $3, $4 );
         }
