@@ -1,0 +1,7 @@
+Maildirlock
+===========
+
+To compile, please install dovecot development package, or install from sources.
+You will also need libtool binary in PATH.
+
+`make -f Makefile.maildirlock DOVECOT_CONFIG=/path/to/dovecot-config`
