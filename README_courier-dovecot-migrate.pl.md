@@ -48,3 +48,6 @@ namespace {
   inbox = yes
 }
 ```
+
+### Source:
+https://web.archive.org/web/20161208093331/http://wiki.dovecot.org/Migration/Courier
