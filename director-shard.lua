@@ -2,7 +2,7 @@
 --
 -- See COPYING for details on license and warranty.
 --
--- https://doc.dovecot.org/3.0/configuration_manual/howto/director_with_lua/
+-- https://doc.dovecot.org/2.4/howto/lua_director.html
 --
 -- IMPORTANT! Remember to change the database credentials before using this
 --
