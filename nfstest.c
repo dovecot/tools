@@ -247,7 +247,7 @@ static void nfs_cache_flush_before(const char *path, int *fd_p,
 	case NFS_CACHE_FLUSH_METHOD_RMDIR_PARENT:
 		p = strrchr(path, '/');
 		if (p == NULL)
-			strcpy(dir, ".");
+			strncpy(dir, ".");
 		else
 			snprintf(dir, p-path+1, "%s", path);
 		path = dir;
