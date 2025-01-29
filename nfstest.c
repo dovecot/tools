@@ -669,7 +669,7 @@ static void nfs_test_fhandlecache_server(int socket_fd, const char *path)
 
 	p = strrchr(path, '/');
 	if (p == NULL)
-		strcpy(dir, ".");
+		strncpy(dir, ".");
 	else
 		snprintf(dir, p - path + 1, "%s", path);
 
