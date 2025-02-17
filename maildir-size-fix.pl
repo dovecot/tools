@@ -12,6 +12,8 @@ use File::Basename;
 use strict;
 
 my $maildirlock_path = "/usr/local/libexec/dovecot/maildirlock";
+# Check if the maildirlock_path exists.
+-e $maildirlock_path or die "maildirlock file /usr/local/libexec/dovecot/maildirlock does not seem to exist, consider checking its location and edit this script if required";
 
 # If UIDLs are based on filename and no P<uidl> entry already exist for
 # a message, write a P<original filename> entry so it doesn't change when
