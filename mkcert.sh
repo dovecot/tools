@@ -6,9 +6,9 @@ set -eux
 # Edit dovecot-openssl.cnf before running this.
 
 umask 077
-OPENSSL=${OPENSSL-openssl}
-SSLDIR=${SSLDIR-/etc/ssl}
-OPENSSLCONFIG=${OPENSSLCONFIG-dovecot-openssl.cnf}
+OPENSSL=${OPENSSL:-openssl}
+SSLDIR=${SSLDIR:-/etc/ssl}
+OPENSSLCONFIG=${OPENSSLCONFIG:-dovecot-openssl.cnf}
 
 CERTDIR=$SSLDIR/certs
 KEYDIR=$SSLDIR/private
